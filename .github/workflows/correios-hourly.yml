@@ -2,8 +2,12 @@ name: Correios hourly Path A/B
 
 on:
   schedule:
-    # Hourly UTC
+    # Every 15 min UTC. GitHub may still delay scheduled runs; more cron
+    # entries = more fire opportunities (not a guarantee of exact :00/:15/:30/:45).
     - cron: "0 * * * *"
+    - cron: "15 * * * *"
+    - cron: "30 * * * *"
+    - cron: "45 * * * *"
   workflow_dispatch:
 
 jobs:

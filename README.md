@@ -72,9 +72,11 @@ media/                    smoke screenshots / JSON results
 docs/                     Path A/B/C plan + project context
 ```
 
-## GitHub Actions (hourly)
+## GitHub Actions (every 15 min)
 
-Workflow: `.github/workflows/correios-hourly.yml` — cron `0 * * * *` (UTC) + `workflow_dispatch`.
+Workflow: `.github/workflows/correios-hourly.yml` — crons `0/15/30/45 * * * *` (UTC) + `workflow_dispatch`.
+
+GitHub may still delay scheduled runs; four cron entries give more fire opportunities than a single hourly cron.
 
 Job command: `npm run hourly` (after materializing `.env.local` from repo secrets).
 

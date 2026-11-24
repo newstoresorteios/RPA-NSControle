@@ -1,0 +1,79 @@
+name: Correios status sync (CWS)
+
+on:
+  schedule:
+    # Every 15 min UTC. GitHub may still delay scheduled runs; more cron
+    # entries = more fire opportunities (not a guarantee of exact :00/:15/:30/:45).
+    - cron: "0 * * * *"
+    - cron: "15 * * * *"
+    - cron: "30 * * * *"
+    - cron: "45 * * * *"
+  workflow_dispatch:
+
+jobs:
+  status-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Materialize .env.local from secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL_UNPOOLED: ${{ secrets.DATABASE_URL_UNPOOLED }}
+          CORREIOS_API_USER: ${{ secrets.CORREIOS_API_USER }}
+          CORREIOS_API_TOKEN: ${{ secrets.CORREIOS_API_TOKEN }}
+          CORREIOS_API_CARTAO: ${{ secrets.CORREIOS_API_CARTAO }}
+          CORREIOS_API_CONTRATO: ${{ secrets.CORREIOS_API_CONTRATO }}
+          CORREIOS_API_DR: ${{ secrets.CORREIOS_API_DR }}
+          CORREIOS_API_URL: ${{ secrets.CORREIOS_API_URL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          required = [
+              "DATABASE_URL",
+              "DATABASE_URL_UNPOOLED",
+              "CORREIOS_API_USER",
+              "CORREIOS_API_TOKEN",
+          ]
+          missing = [k for k in required if not os.environ.get(k)]
+          if missing:
+              print("Missing required GitHub secrets:", ", ".join(missing), file=sys.stderr)
+              print(
+                  "CORREIOS_API_TOKEN must be the CWS access code (código de acesso), not a JWT.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          optional = [
+              "CORREIOS_API_CARTAO",
+              "CORREIOS_API_CONTRATO",
+              "CORREIOS_API_DR",
+              "CORREIOS_API_URL",
+          ]
+          with open(".env.local", "w", encoding="utf-8", newline="\n") as f:
+              for k in required:
+                  f.write(f"{k}={os.environ[k]}\n")
+              for k in optional:
+                  value = os.environ.get(k)
+                  if value:
+                      f.write(f"{k}={value}\n")
+          print("Wrote .env.local (values redacted)")
+          print("Note: CORREIOS_API_TOKEN = CWS access code, not JWT")
+          PY
+
+      - name: Run CWS Rastro status sync
+        run: npm run status-sync

@@ -7,6 +7,7 @@
   "scripts": {
     "smoke": "node --env-file=.env.local scripts/correios-rpa-smoke.mjs",
     "hourly": "node --env-file=.env.local scripts/correios-rpa-hourly.mjs",
+    "status-sync": "node --env-file=.env.local scripts/correios-status-sync.mjs",
     "recover": "node --env-file=.env.local scripts/correios-rpa-recover-boleto.mjs",
     "copiar-once": "node --env-file=.env.local scripts/correios-rpa-copiar-once.mjs",
     "imprimir-once": "node --env-file=.env.local scripts/correios-rpa-imprimir-once.mjs",

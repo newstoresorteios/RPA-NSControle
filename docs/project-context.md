@@ -14,10 +14,11 @@ RPA que acessa o **Portal Importador** dos Correios, pesquisa remessas por rastr
 - **Store of record:** Neon NSControle — tabelas `ctl_correios_scrape_runs`, `ctl_correios_taxas`, `ctl_correios_boletos` com FK `order_id` → `ctl_orders.id`
 - **Também atualiza** `ctl_orders.import_tax`, `tax_identified_at`, `tax_paid`, `notes_robot` (contabilidade / fila Financeiro > Taxas)
 - **Fonte de rastreios:** preferir `ctl_orders.tracking_code` (planilha é espelho: Produto=rastreio, Taxa Paga, Observações Robô)
-- **Agenda:** GitHub Actions a cada 15 min (crons `0/15/30/45` UTC); local também via `npm run hourly`
-- **Não confundir** com sync CWS Rastro (`CORREIOS_USUARIO` / `CORREIOS_SENHA` / `CORREIOS_CARTAO`) — só tracking, sem taxa/boleto
+- **Agenda Path A/B:** GitHub Actions `correios-hourly.yml` a cada 15 min (crons `0/15/30/45` UTC); local via `npm run hourly`
+- **Agenda status CWS:** GitHub Actions `correios-status-sync.yml` (mesmo padrão de cron) → `npm run status-sync` atualiza `ctl_orders.tracking_*` / `delivered` via API Rastro (sem Playwright)
+- **Credenciais separadas:** Portal = `CORREIOS_USER` / `CORREIOS_PASSWORD`; CWS API = `CORREIOS_API_USER` / `CORREIOS_API_TOKEN` (código de acesso, não JWT)
 
 ## Stack
-- Node.js + Playwright
+- Node.js + Playwright (Portal) + `postgres` + fetch (CWS status sync)
 - Neon Postgres do NSControle (migrations em `scripts/migrations/`)
-- Segredos só via env; plano: [plano-rpa-correios.md](./plano-rpa-correios.md)
+- Segredos só via env / Actions secrets; plano: [plano-rpa-correios.md](./plano-rpa-correios.md)

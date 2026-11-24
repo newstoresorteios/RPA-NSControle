@@ -9,6 +9,7 @@ Migrated from `NSControle` feature branches (`cursor/correios-tax-tables-*`, `cu
 ```bash
 cp .env.example .env.local
 # fill DATABASE_URL / DATABASE_URL_UNPOOLED / CORREIOS_USER / CORREIOS_PASSWORD
+# for status sync also: CORREIOS_API_USER / CORREIOS_API_TOKEN (CWS access code, not JWT)
 npm install
 ```
 
@@ -36,6 +37,11 @@ npm run smoke -- LX335304323JP
 # HOURLY_LIMIT=12 by default; GitHub Actions cron uses this
 npm run hourly
 # npm run hourly -- --limit 5
+
+# CWS Rastro status sync (API → Neon ctl_orders tracking_* / delivered)
+npm run status-sync
+# npm run status-sync -- --limit 40
+# npm run status-sync -- --mock
 
 # Path C single / batch
 npm run entregues -- LW061145525US
@@ -74,15 +80,28 @@ docs/                     Path A/B/C plan + project context
 
 ## GitHub Actions (every 15 min)
 
-Workflow: `.github/workflows/correios-hourly.yml` — crons `0/15/30/45 * * * *` (UTC) + `workflow_dispatch`.
+Two workflows share the dense cron pattern `0/15/30/45 * * * *` (UTC) + `workflow_dispatch`. GitHub may still delay scheduled runs; four cron entries give more fire opportunities than a single hourly cron.
 
-GitHub may still delay scheduled runs; four cron entries give more fire opportunities than a single hourly cron.
+| Workflow | Job | Command |
+|----------|-----|---------|
+| `.github/workflows/correios-hourly.yml` | Portal Importador Path A/B | `npm run hourly` |
+| `.github/workflows/correios-status-sync.yml` | CWS Rastro → Neon status/delivered | `npm run status-sync` |
 
-Job command: `npm run hourly` (after materializing `.env.local` from repo secrets).
+### Path A/B secrets (names only)
 
-Required repo secrets (names only): `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `CORREIOS_USER`, `CORREIOS_PASSWORD`. Workflow forces `HEADED=0`.
+`DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `CORREIOS_USER`, `CORREIOS_PASSWORD`. Workflow forces `HEADED=0`.
+
+### Status sync secrets (names only)
+
+Required: `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `CORREIOS_API_USER`, `CORREIOS_API_TOKEN`.
+
+Optional: `CORREIOS_API_CARTAO`, `CORREIOS_API_CONTRATO`, `CORREIOS_API_DR`, `CORREIOS_API_URL`.
+
+`CORREIOS_API_TOKEN` = **código de acesso CWS** (access code), **not** a JWT and **not** the Portal site password (`CORREIOS_PASSWORD`).
+
+Status sync uses `npm ci --ignore-scripts` (no Playwright). Schema needs `ctl_orders.tracking_checked_at` (migration `scripts/migrations/20261124_ctl_orders_tracking_checked_at.sql`). Panel spreadsheet columns live in NSControle — DB updates work from this script alone once those columns exist.
 
 ## Security
 
-- Portal password and Neon URLs: env only
-- Do not confuse with CWS Rastro (`CORREIOS_USUARIO` / `CORREIOS_SENHA` / `CORREIOS_CARTAO`) used by NSControle tracking sync — those are out of scope here
+- Portal password, CWS access code, and Neon URLs: env / Actions secrets only
+- Keep Portal (`CORREIOS_USER` / `CORREIOS_PASSWORD`) separate from CWS API (`CORREIOS_API_USER` / `CORREIOS_API_TOKEN`)

@@ -1,7 +1,10 @@
 /**
- * One-shot smoke: Portal Importador → tracking → boleto → Neon upsert.
- * Usage: node --env-file=.env.local scripts/correios-rpa-smoke.mjs [TRACKING]
+ * Portal Importador → tracking → boleto → Neon upsert.
+ * Usage: node --env-file=.env.local scripts/correios-rpa-smoke.mjs [TRACKING...]
+ * One browser session for every tracking on the command line.
+ * Network resets are not stored as payment_status=error (the hourly queue retries them).
  * Never logs CORREIOS_PASSWORD. Does not set tax_paid=true on boleto generation.
+ * Delivered / pagamento confirmado opens the receipt and may set tax_paid when an amount is read.
  *
  * Branching (Paulo):
  *   Path A — first issue: search → $ → ciência → Concluir → Boleto → pagfacil → Copiar
@@ -13,18 +16,31 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import { chromium } from "playwright";
-import { capturePagfacilBoleto, extractLinha } from "./lib/pagfacil-capture.mjs";
+import { capturePagfacilBoleto } from "./lib/pagfacil-capture.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..");
-const TRACKING = (process.argv[2] || "LX335304323JP").trim().toUpperCase();
 const SEARCH_URL =
   "https://portalimportador.correios.com.br/pages/pesquisarRemessaImportador/pesquisarRemessaImportador.jsf";
-const MEDIA =
-  process.env.SMOKE_MEDIA_DIR ||
-  join(ROOT, "media", "smoke-" + TRACKING);
 const BOLETOS_DIR = join(ROOT, "storage", "boletos");
 const HEADED = process.env.HEADED !== "0";
+const CHROME_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+function parseTrackings(argv) {
+  const args = argv.slice(2).map((s) => String(s || "").trim().toUpperCase()).filter(Boolean);
+  return args.length ? args : ["LX335304323JP"];
+}
+
+const TRACKINGS = parseTrackings(process.argv);
+let TRACKING = TRACKINGS[0];
+const MEDIA_ROOT = process.env.SMOKE_MEDIA_DIR || join(ROOT, "media");
+let MEDIA = join(MEDIA_ROOT, "smoke-" + TRACKING);
+
+function isTransientError(err) {
+  const msg = String(err?.message || err || "");
+  return /ERR_CONNECTION|ERR_TIMED_OUT|ERR_NETWORK|ERR_ABORTED|ERR_EMPTY_RESPONSE|net::|Timeout|Target closed|Session closed|browser has been closed|Execution context was destroyed|Navigation failed|tracking input not found|result row not found|username field not found|password field not found/i.test(msg);
+}
 
 function loadEnv() {
   const values = { ...process.env };
@@ -127,15 +143,80 @@ async function gotoRetry(page, url, attempts = 4) {
   let lastErr;
   for (let i = 1; i <= attempts; i++) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+      // commit survives Correios resets better than waiting for DOM on the first byte
+      await page.goto(url, { waitUntil: "commit", timeout: 45000 });
+      await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+      const body = await page.locator("body").innerText().catch(() => "");
+      if (/ERR_CONNECTION|n[aã]o [eé] poss[ií]vel acessar/i.test(body)) {
+        throw new Error("net::ERR_CONNECTION_RESET chrome error page");
+      }
       return;
     } catch (err) {
       lastErr = err;
-      console.log(`goto retry ${i}/${attempts}:`, err instanceof Error ? err.message.slice(0, 120) : err);
-      await page.waitForTimeout(2000 * i);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`goto retry ${i}/${attempts}:`, msg.slice(0, 160));
+      const reset = /ERR_CONNECTION|ERR_TIMED_OUT|net::|Timeout/i.test(msg);
+      await page.waitForTimeout(reset ? 8000 * i : 2000 * i);
     }
   }
   throw lastErr;
+}
+
+async function launchBrowser() {
+  const opts = {
+    headless: !HEADED,
+    args: ["--disable-popup-blocking", "--disable-http2"],
+  };
+  try {
+    return await chromium.launch({ ...opts, channel: "chrome" });
+  } catch {
+    return await chromium.launch(opts);
+  }
+}
+
+function contextOptions() {
+  return {
+    acceptDownloads: true,
+    locale: "pt-BR",
+    viewport: { width: 1400, height: 900 },
+    userAgent: CHROME_UA,
+    permissions: ["clipboard-read", "clipboard-write"],
+  };
+}
+
+async function tryComprovante(page, context, tracking) {
+  const row = page.locator("table tbody tr, tr").filter({ hasText: tracking }).first();
+  if (!(await row.count())) return null;
+  const icons = row.locator("td").first().locator("a:visible, button:visible, span.ui-button:visible");
+  if (!(await icons.count())) return null;
+  await icons.nth(0).click({ force: true });
+  await page.waitForTimeout(1200);
+  await waitAguardeGone(page, 20000);
+  const imprimir = page.getByRole("button", { name: /Imprimir comprovante/i })
+    .or(page.locator('button:has-text("Imprimir comprovante"), a:has-text("Imprimir comprovante")'))
+    .first();
+  let text = "";
+  if (await imprimir.count()) {
+    const popupPromise = context.waitForEvent("page", { timeout: 20000 }).catch(() => null);
+    await imprimir.click({ force: true });
+    const popup = await popupPromise;
+    const target = popup || page;
+    await target.waitForLoadState("domcontentloaded").catch(() => {});
+    text = await target.locator("body").innerText().catch(() => "");
+    if (popup) await popup.close().catch(() => {});
+  } else {
+    text = await page.locator("body").innerText().catch(() => "");
+  }
+  await page.getByRole("button", { name: /^Fechar$/i }).click({ force: true }).catch(() => {});
+  await page.keyboard.press("Escape").catch(() => {});
+  const digits = String(text).replace(/\D/g, "");
+  const candidate = (digits.match(/\d{47,48}/g) || []).find((value) =>
+    /^(237|341|033|001|104|748|422|077|756|041|389)/.test(value),
+  );
+  return {
+    amount: parseMoney(text),
+    linha: candidate ? candidate.slice(0, 47) : null,
+  };
 }
 
 async function upsertDb(env, payload) {
@@ -238,6 +319,7 @@ async function upsertDb(env, payload) {
         update ctl_orders set
           tax_identified_at = coalesce(tax_identified_at, now()),
           import_tax = ${payload.taxAmount},
+          tax_paid = case when ${payload.taxPaid === true} then true else tax_paid end,
           notes_robot = case
             when notes_robot is null or notes_robot = '' then ${payload.note}
             when notes_robot like ${"%" + payload.note + "%"} then notes_robot
@@ -262,49 +344,24 @@ async function main() {
     console.error("FAIL: CORREIOS_USER / CORREIOS_PASSWORD missing in env");
     process.exit(2);
   }
-  console.log("tracking:", TRACKING);
+  console.log("tracking:", TRACKINGS.join(","));
   console.log("user_set: yes len=" + user.length);
   console.log("headed:", HEADED);
   mkdirSync(BOLETOS_DIR, { recursive: true });
   mkdirSync(MEDIA, { recursive: true });
 
-  const result = {
-    ok: false,
-    taxAmount: null,
-    linha: null,
-    pdfPath: null,
-    pdfSha: null,
-    portalOrderId: null,
-    dueDate: null,
-    paymentStatus: "error",
-    error: null,
-    note: `smoke ${TRACKING} ${new Date().toISOString().slice(0, 10)}`,
-    raw: {},
-  };
-
-  const browser = await chromium.launch({
-    headless: !HEADED,
-    args: ["--disable-popup-blocking"],
-  });
-  const context = await browser.newContext({
-    acceptDownloads: true,
-    locale: "pt-BR",
-    viewport: { width: 1400, height: 900 },
-    permissions: ["clipboard-read", "clipboard-write"],
-  });
-  // pagfacil may open as cross-origin popup
+  let browser = await launchBrowser();
+  let context = await browser.newContext(contextOptions());
   await context.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
-  const page = await context.newPage();
+  let page = await context.newPage();
 
-  try {
-    // Login via CAS service URL (from planilha Logins)
+  async function loginPage(target) {
     const loginUrl =
       "https://cas.correios.com.br/login?service=" +
       encodeURIComponent(SEARCH_URL);
-    await gotoRetry(page, loginUrl);
-    await shot(page, "01-login.png");
+    await gotoRetry(target, loginUrl);
+    await shot(target, "01-login.png");
 
-    // Fill username/password — Correios CAS fields vary
     const userSel = [
       'input[name="username"]',
       "#username",
@@ -318,7 +375,7 @@ async function main() {
     ];
     let filled = false;
     for (const us of userSel) {
-      const el = page.locator(us).first();
+      const el = target.locator(us).first();
       if (await el.count()) {
         await el.fill(user);
         filled = true;
@@ -328,7 +385,7 @@ async function main() {
     if (!filled) throw new Error("username field not found");
     let passFilled = false;
     for (const ps of passSel) {
-      const el = page.locator(ps).first();
+      const el = target.locator(ps).first();
       if (await el.count()) {
         await el.fill(pass);
         passFilled = true;
@@ -337,54 +394,113 @@ async function main() {
     }
     if (!passFilled) throw new Error("password field not found");
 
-    // Submit
-    const submit = page.locator(
+    const submit = target.locator(
       'button[type="submit"], input[type="submit"], button:has-text("LOGIN"), button:has-text("Entrar"), input[value*="LOGIN" i]',
     ).first();
     await submit.click();
-    await page.waitForLoadState("domcontentloaded", { timeout: 60000 });
-    await page.waitForTimeout(2000);
-    await shot(page, "02-after-login.png");
+    await target.waitForLoadState("domcontentloaded", { timeout: 60000 });
+    await target.waitForTimeout(2000);
+    await shot(target, "02-after-login.png");
 
-    // CAPTCHA / failure detection
-    const bodyText = await page.locator("body").innerText().catch(() => "");
+    const bodyText = await target.locator("body").innerText().catch(() => "");
     if (/captcha|recaptcha|desafio|código de segurança/i.test(bodyText) && /password|senha|login/i.test(bodyText)) {
-      result.error = "CAPTCHA or login challenge detected";
-      result.raw.blocker = "captcha";
-      await shot(page, "02b-captcha.png");
-      throw new Error(result.error);
+      await shot(target, "02b-captcha.png");
+      throw new Error("CAPTCHA or login challenge detected");
     }
-    if (/usu[aá]rio ou senha inv[aá]lid|authentication failed|credenciais/i.test(bodyText) && page.url().includes("login")) {
-      result.error = "login failed (invalid credentials?)";
-      throw new Error(result.error);
+    if (/usu[aá]rio ou senha inv[aá]lid|authentication failed|credenciais/i.test(bodyText) && target.url().includes("login")) {
+      throw new Error("login failed (invalid credentials?)");
     }
 
-    // Ensure on search page (Correios sometimes resets the connection)
-    if (!page.url().includes("pesquisarRemessaImportador") || /ERR_|não é possível acessar/i.test(await page.locator("body").innerText().catch(() => ""))) {
-      await gotoRetry(page, SEARCH_URL);
-      await page.waitForTimeout(1500);
+    const searchLink = target.locator('a[href*="pesquisarRemessaImportador"]').first();
+    if (await searchLink.count() && await searchLink.isVisible().catch(() => false)) {
+      await searchLink.click({ force: true }).catch(() => {});
+      await target.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+    }
+    const landed = await target.locator("body").innerText().catch(() => "");
+    if (!target.url().includes("pesquisarRemessaImportador") || /ERR_|não é possível acessar/i.test(landed)) {
+      await gotoRetry(target, SEARCH_URL);
+      await target.waitForTimeout(1500);
     }
 
-    // Dismiss "NOTÍCIA IMPORTANTE" / Entendi modal if present
     for (let i = 0; i < 3; i++) {
-      const entendi = page.getByRole("button", { name: /^Entendi$/i })
-        .or(page.locator('button:has-text("Entendi"), input[value="Entendi"], a:has-text("Entendi")'))
+      const entendi = target.getByRole("button", { name: /^Entendi$/i })
+        .or(target.locator('button:has-text("Entendi"), input[value="Entendi"], a:has-text("Entendi")'))
         .first();
       if (await entendi.count()) {
         const visible = await entendi.isVisible().catch(() => false);
         if (visible) {
           await entendi.click({ force: true });
-          await page.waitForTimeout(800);
+          await target.waitForTimeout(800);
           console.log("dismissed modal: Entendi");
         } else break;
       } else break;
     }
-    // Also close any dialog overlay via Escape
-    await page.keyboard.press("Escape").catch(() => {});
-    await page.waitForTimeout(400);
-    await shot(page, "03-search-page.png");
+    await target.keyboard.press("Escape").catch(() => {});
+    await target.waitForTimeout(400);
+    await shot(target, "03-search-page.png");
+  }
 
-    // Fill tracking search — visible text input under Pesquisar Encomenda
+  async function recoverSession() {
+    console.log("session_recover");
+    await page.waitForTimeout(12000).catch(() => {});
+    await browser.close().catch(() => {});
+    browser = await launchBrowser();
+    context = await browser.newContext(contextOptions());
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
+    page = await context.newPage();
+    await loginPage(page);
+  }
+
+  try {
+    await loginPage(page);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const credential = /CAPTCHA|invalid credentials|login failed/i.test(msg);
+    for (const code of TRACKINGS) {
+      const line = JSON.stringify({ tracking: code, error: msg.slice(0, 300) });
+      if (credential) console.error("SMOKE_FAIL", line);
+      else console.log("SMOKE_RETRY", line);
+    }
+    if (credential) process.exitCode = 1;
+    await browser.close().catch(() => {});
+    return;
+  }
+
+  let transientStreak = 0;
+  try {
+    for (let index = 0; index < TRACKINGS.length; index++) {
+      TRACKING = TRACKINGS[index];
+      MEDIA = join(MEDIA_ROOT, "smoke-" + TRACKING);
+      mkdirSync(MEDIA, { recursive: true });
+      console.log("tracking:", TRACKING, `${index + 1}/${TRACKINGS.length}`);
+      const result = {
+        ok: false,
+        taxAmount: null,
+        linha: null,
+        pdfPath: null,
+        pdfSha: null,
+        portalOrderId: null,
+        dueDate: null,
+        paymentStatus: "error",
+        taxPaid: false,
+        error: null,
+        note: `smoke ${TRACKING} ${new Date().toISOString().slice(0, 10)}`,
+        raw: {},
+      };
+
+      try {
+        if (index > 0) {
+          for (const extra of context.pages()) {
+            if (extra !== page) await extra.close().catch(() => {});
+          }
+          await gotoRetry(page, SEARCH_URL, 3);
+          const entendiAgain = page.getByRole("button", { name: /^Entendi$/i }).first();
+          if (await entendiAgain.count() && await entendiAgain.isVisible().catch(() => false)) {
+            await entendiAgain.click({ force: true }).catch(() => {});
+          }
+          await page.keyboard.press("Escape").catch(() => {});
+        }
+        // Fill tracking search — visible text input under Pesquisar Encomenda
     const labeled = page.getByLabel(/c[oó]digo da encomenda/i);
     if (await labeled.count()) {
       await labeled.fill(TRACKING);
@@ -434,14 +550,33 @@ async function main() {
         /\bpago\b|\bquitad/i.test(resultText);
       const notFound = /n[aã]o encontr|sem registro|nenhum registro/i.test(resultText);
 
-      if (delivered) {
-        result.paymentStatus = "no_action";
-        result.raw.situation = "delivered";
-        result.note = `smoke ${TRACKING}: delivered (Entregue) — skip Path A/B; status=no_action`;
+      if (delivered || paymentConfirmed) {
+        let receipt = null;
+        try {
+          receipt = await tryComprovante(page, context, TRACKING);
+        } catch (e) {
+          if (isTransientError(e)) throw e;
+          console.log("comprovante_skip", String(e?.message || e).slice(0, 140));
+        }
+        const situation = delivered ? "delivered" : "payment_confirmed";
+        result.raw.situation = situation;
+        if (receipt?.amount) {
+          result.taxAmount = receipt.amount;
+          result.linha = receipt.linha;
+          result.paymentStatus = "paid";
+          result.taxPaid = true;
+          result.note = `smoke ${TRACKING}: ${situation} comprovante amount=${receipt.amount}`;
+        } else if (delivered) {
+          result.paymentStatus = "no_action";
+          result.note = `smoke ${TRACKING}: delivered (Entregue) — comprovante sem valor; status=no_action`;
+        } else {
+          result.paymentStatus = "paid";
+          result.note = `smoke ${TRACKING}: paid/confirmado — comprovante sem valor; status=paid`;
+        }
         result.error = null;
       } else if (paidLike) {
         result.paymentStatus = "paid";
-        result.raw.situation = paymentConfirmed ? "payment_confirmed" : "paid";
+        result.raw.situation = "paid";
         result.note = `smoke ${TRACKING}: paid/confirmado — skip Path A/B; status=paid`;
         result.error = null;
       } else if (notFound) {
@@ -457,8 +592,7 @@ async function main() {
       }
 
       result.ok = true;
-      // still try to capture any valor on page
-      result.taxAmount = parseMoney(resultText);
+      result.taxAmount = result.taxAmount || parseMoney(resultText);
       const db = await upsertDb(env, result);
       writeFileSync(join(MEDIA, "result.json"), JSON.stringify({ result, db }, null, 2));
       console.log("DB:", JSON.stringify(db, null, 2));
@@ -475,7 +609,8 @@ async function main() {
         taxId: db.tax?.id || null,
         boletoId: db.boleto?.id || null,
       }));
-      return;
+      transientStreak = 0;
+      continue;
     }
 
     result.paymentStatus = "awaiting_payment";
@@ -713,19 +848,53 @@ async function main() {
       taxId: db.tax?.id || null,
       boletoId: db.boleto?.id || null,
     }));
-  } catch (err) {
-    result.error = err instanceof Error ? err.message : String(err);
-    result.ok = false;
-    await shot(page, "99-error.png").catch(() => {});
-    try {
-      const db = await upsertDb(env, result);
-      writeFileSync(join(MEDIA, "result.json"), JSON.stringify({ result, db }, null, 2));
-      console.log("DB:", JSON.stringify(db, null, 2));
-    } catch (dbErr) {
-      console.error("DB upsert failed:", dbErr instanceof Error ? dbErr.message : dbErr);
+        transientStreak = 0;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        result.error = msg;
+        result.ok = false;
+        if (isTransientError(err)) {
+          transientStreak += 1;
+          console.log("transient", TRACKING, `${transientStreak}/3`, msg.slice(0, 160));
+          if (transientStreak >= 3) {
+            console.log("SMOKE_RETRY", JSON.stringify({ tracking: TRACKING, error: msg.slice(0, 300) }));
+            console.log("SMOKE_ABORT", JSON.stringify({ reason: "connection_reset_streak" }));
+            for (let j = index + 1; j < TRACKINGS.length; j++) {
+              console.log("SMOKE_RETRY", JSON.stringify({
+                tracking: TRACKINGS[j],
+                error: "aborted_after_connection_reset_streak",
+              }));
+            }
+            break;
+          }
+          try {
+            await recoverSession();
+          } catch (loginErr) {
+            const loginMsg = loginErr instanceof Error ? loginErr.message : String(loginErr);
+            console.log("SMOKE_RETRY", JSON.stringify({ tracking: TRACKING, error: loginMsg.slice(0, 300) }));
+            console.log("SMOKE_ABORT", JSON.stringify({ reason: "relogin_failed" }));
+            for (let j = index + 1; j < TRACKINGS.length; j++) {
+              console.log("SMOKE_RETRY", JSON.stringify({ tracking: TRACKINGS[j], error: "relogin_failed" }));
+            }
+            break;
+          }
+          index -= 1;
+          continue;
+        }
+        await shot(page, "99-error.png").catch(() => {});
+        try {
+          const db = await upsertDb(env, result);
+          writeFileSync(join(MEDIA, "result.json"), JSON.stringify({ result, db }, null, 2));
+          console.log("DB:", JSON.stringify(db, null, 2));
+        } catch (dbErr) {
+          console.error("DB upsert failed:", dbErr instanceof Error ? dbErr.message : dbErr);
+        }
+        console.error("SMOKE_FAIL", JSON.stringify({ tracking: TRACKING, error: msg.slice(0, 300) }));
+        process.exitCode = 1;
+        transientStreak = 0;
+      }
+      await page.waitForTimeout(1200).catch(() => {});
     }
-    console.error("SMOKE_FAIL", result.error);
-    process.exitCode = 1;
   } finally {
     await browser.close().catch(() => {});
   }

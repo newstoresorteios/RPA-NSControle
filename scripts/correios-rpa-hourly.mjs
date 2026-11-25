@@ -1,19 +1,20 @@
 /**
  * Bounded hourly Path A/B queue runner.
- * Pulls pending trackings from Neon ctl_orders, runs smoke for each.
+ * Pulls pending trackings from Neon ctl_orders and runs them in ONE smoke session.
  *
  * Usage:
  *   node --env-file=.env.local scripts/correios-rpa-hourly.mjs [--limit N]
  *
  * Env:
- *   HOURLY_LIMIT (default 12) — max trackings per run (~5 min each → fits 60m job)
+ *   HOURLY_LIMIT (default 12) — max trackings per run
  *   HEADED=0 for CI/headless
  *
- * Queue (Path A/B):
- *   tracking_code present, tax_paid = false, and either no ctl_correios_taxas row
- *   or payment_status in awaiting_payment / boleto_pending / pending.
- * Skips terminal / non-productive: paid, not_found, no_action (delivered), overdue, error.
- * Prefer awaiting_payment / boleto_pending / pending over stale error rows.
+ * Queue:
+ *   tax_paid = false, and either a row still awaiting/pending,
+ *   a network error from the last 2 days, or no taxas row yet
+ *   on an order that is not already Entregue.
+ * Network resets stay out of the table (smoke prints SMOKE_RETRY) so the next hour retries them.
+ * not_found and no_action stay terminal.
  */
 import { spawn } from "node:child_process";
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
@@ -48,11 +49,11 @@ function parseArgs(argv) {
   return { limit: Math.min(Math.floor(limit), 40) };
 }
 
-function runSmoke(tracking, env) {
+function runSmoke(trackings, env) {
   return new Promise((resolvePromise) => {
     const child = spawn(
       process.execPath,
-      ["--env-file=.env.local", "scripts/correios-rpa-smoke.mjs", tracking],
+      ["--env-file=.env.local", "scripts/correios-rpa-smoke.mjs", ...trackings],
       {
         cwd: ROOT,
         stdio: ["ignore", "pipe", "pipe"],
@@ -74,62 +75,36 @@ function runSmoke(tracking, env) {
   });
 }
 
-const TERMINAL_OK_STATUSES = new Set([
-  "not_found",
-  "no_action",
-  "paid",
-  "boleto_generated",
-  "boleto_pending",
-  "awaiting_payment",
-]);
-
-function parseSmokeOutcome(out, tracking) {
-  const lines = out.split(/\r?\n/);
-  const okLine = [...lines].reverse().find((l) => l.startsWith("SMOKE_OK"));
-  if (okLine) {
-    const jsonStart = okLine.indexOf("{");
-    try {
-      return { ok: true, ...(jsonStart >= 0 ? JSON.parse(okLine.slice(jsonStart)) : { tracking }) };
-    } catch {
-      return { ok: true, tracking };
-    }
-  }
-  // Early terminal exits print RESULT (ok:true) without SMOKE_OK — treat as handled success.
-  const resultLine = [...lines].reverse().find((l) => l.startsWith("RESULT:"));
-  if (resultLine) {
-    const jsonStart = resultLine.indexOf("{");
+function parseSmokeLines(out) {
+  const items = [];
+  for (const line of out.split(/\r?\n/)) {
+    const tag = line.startsWith("SMOKE_OK")
+      ? "ok"
+      : line.startsWith("SMOKE_FAIL")
+        ? "fail"
+        : line.startsWith("SMOKE_RETRY")
+          ? "retry"
+          : null;
+    if (!tag) continue;
+    const jsonStart = line.indexOf("{");
+    let parsed = {};
     if (jsonStart >= 0) {
       try {
-        const parsed = JSON.parse(resultLine.slice(jsonStart));
-        if (parsed && parsed.ok === true) {
-          return {
-            ok: true,
-            tracking: parsed.tracking || tracking,
-            paymentStatus: parsed.paymentStatus || null,
-            taxAmount: parsed.taxAmount ?? null,
-            linha: parsed.linha ?? null,
-            pdfPath: parsed.pdfPath ?? null,
-            terminal: true,
-          };
-        }
-        if (parsed && parsed.ok === false) {
-          return {
-            ok: false,
-            tracking: parsed.tracking || tracking,
-            paymentStatus: parsed.paymentStatus || null,
-            error: parsed.error || "result_ok_false",
-          };
-        }
+        parsed = JSON.parse(line.slice(jsonStart));
       } catch {
-        /* fall through */
+        parsed = {};
       }
     }
+    items.push({
+      tag,
+      tracking: parsed.tracking || null,
+      paymentStatus: parsed.paymentStatus || null,
+      linha: parsed.linha || null,
+      pdfPath: parsed.pdfPath || null,
+      error: parsed.error || (tag === "fail" ? line.replace(/^SMOKE_FAIL\s*/, "").trim() : null),
+    });
   }
-  const failLine = [...lines].reverse().find((l) => l.startsWith("SMOKE_FAIL"));
-  if (failLine) {
-    return { ok: false, tracking, error: failLine.replace(/^SMOKE_FAIL\s*/, "").trim() || "smoke_fail" };
-  }
-  return null;
+  return items;
 }
 
 const args = parseArgs(process.argv);
@@ -153,7 +128,7 @@ const report = {
   scrapeRunId: null,
   queue: [],
   results: [],
-  summary: { seen: 0, ok: 0, failed: 0, skippedEmpty: false },
+  summary: { seen: 0, ok: 0, failed: 0, deferred: 0, skippedEmpty: false },
 };
 
 try {
@@ -176,17 +151,29 @@ try {
       and length(trim(o.tracking_code)) >= 8
       and coalesce(o.tax_paid, false) = false
       and (
-        t.id is null
-        or t.payment_status in ('awaiting_payment', 'boleto_pending', 'pending')
+        t.payment_status in ('awaiting_payment', 'boleto_pending', 'pending')
+        or (
+          t.payment_status = 'error'
+          and t.last_scraped_at >= now() - interval '2 days'
+        )
+        or (
+          t.id is null
+          and coalesce(o.delivered, false) = false
+          and coalesce(o.tracking_situation, '') !~* 'entregue'
+        )
       )
     order by
       case t.payment_status
         when 'awaiting_payment' then 0
         when 'boleto_pending' then 1
         when 'pending' then 2
-        else 3
+        when 'error' then 3
+        else 4
       end,
-      o.tax_identified_at nulls first,
+      case
+        when coalesce(o.tracking_situation, '') ~* 'alfand|aduane|fiscal|tribut' then 0
+        else 1
+      end,
       o.created_at desc nulls last
     limit ${args.limit}
   `;
@@ -222,12 +209,21 @@ try {
 
   let upserted = 0;
   let boletos = 0;
+  const trackings = rows.map((r) => r.tracking_code);
+  for (const row of rows) {
+    console.log("HOURLY_ITEM", row.tracking_code, "order", row.order_key, "status", row.payment_status || "none");
+  }
+
+  const { out } = await runSmoke(trackings, env);
+  const parsed = parseSmokeLines(out);
+  const byTracking = new Map();
+  for (const item of parsed) {
+    if (item.tracking) byTracking.set(item.tracking, item);
+  }
 
   for (const row of rows) {
     const tracking = row.tracking_code;
-    console.log("HOURLY_ITEM", tracking, "order", row.order_key, "status", row.payment_status || "none");
-    const { code, out } = await runSmoke(tracking, env);
-    const parsed = parseSmokeOutcome(out, tracking) || { ok: false, error: `exit_${code}` };
+    const item = byTracking.get(tracking);
     const neon = await sql`
       select t.payment_status, t.linha_digitavel, t.pdf_path, o.import_tax
       from ctl_orders o
@@ -237,33 +233,36 @@ try {
       limit 1
     `;
     const rowN = neon[0];
-    const neonStatus = rowN?.payment_status || null;
-    const parsedStatus = parsed.paymentStatus || null;
-    const ok =
-      code === 0 &&
-      (parsed.ok === true ||
-        rowN?.import_tax != null ||
-        TERMINAL_OK_STATUSES.has(parsedStatus) ||
-        TERMINAL_OK_STATUSES.has(neonStatus));
-    if (ok) {
+    const deferred = !item || item.tag === "retry";
+    const ok = item?.tag === "ok";
+    if (deferred) {
+      report.summary.deferred += 1;
+    } else if (ok) {
       report.summary.ok += 1;
       upserted += 1;
-      if (parsed.linha || parsed.pdfPath || rowN?.linha_digitavel || rowN?.pdf_path) boletos += 1;
+      if (item?.linha || item?.pdfPath || rowN?.linha_digitavel || rowN?.pdf_path) boletos += 1;
     } else {
       report.summary.failed += 1;
     }
     report.results.push({
       tracking,
       order_key: row.order_key,
-      exit: code,
-      ok,
-      paymentStatus: parsed.paymentStatus || rowN?.payment_status || null,
-      error: ok ? null : parsed.error || "smoke_or_neon_miss",
+      exit: item?.tag === "fail" ? 1 : 0,
+      ok: deferred ? false : ok,
+      deferred,
+      paymentStatus: item?.paymentStatus || rowN?.payment_status || null,
+      error: deferred ? (item?.error || "retry") : ok ? null : item?.error || "smoke_or_neon_miss",
     });
   }
 
   const status =
-    report.summary.failed === 0 ? "success" : report.summary.ok > 0 ? "partial" : "failed";
+    report.summary.failed === 0
+      ? report.summary.deferred > 0
+        ? "partial"
+        : "success"
+      : report.summary.ok > 0 || report.summary.deferred > 0
+        ? "partial"
+        : "failed";
   const errorSummary = report.results
     .filter((r) => !r.ok)
     .slice(0, 8)

@@ -37,9 +37,14 @@ let TRACKING = TRACKINGS[0];
 const MEDIA_ROOT = process.env.SMOKE_MEDIA_DIR || join(ROOT, "media");
 let MEDIA = join(MEDIA_ROOT, "smoke-" + TRACKING);
 
+function isNetworkError(err) {
+  const msg = String(err?.message || err || "");
+  return /ERR_CONNECTION|ERR_TIMED_OUT|ERR_NETWORK|ERR_ABORTED|ERR_EMPTY_RESPONSE|net::|Target closed|Session closed|browser has been closed|Execution context was destroyed/i.test(msg);
+}
+
 function isTransientError(err) {
   const msg = String(err?.message || err || "");
-  return /ERR_CONNECTION|ERR_TIMED_OUT|ERR_NETWORK|ERR_ABORTED|ERR_EMPTY_RESPONSE|net::|Timeout|Target closed|Session closed|browser has been closed|Execution context was destroyed|Navigation failed|tracking input not found|result row not found|username field not found|password field not found/i.test(msg);
+  return isNetworkError(err) || /Timeout|Navigation failed|tracking input not found|result row not found|username field not found|password field not found/i.test(msg);
 }
 
 function loadEnv() {
@@ -584,6 +589,11 @@ async function main() {
         result.raw.situation = "not_found";
         result.note = `smoke ${TRACKING}: not_found on portal — skip Path A/B`;
         result.error = `situation not Aguardando Pagamento (status=not_found)`;
+      } else if (/Documento vinculado|Fiscaliza[cç]|Aguardando an[aá]lise/i.test(resultText)) {
+        result.paymentStatus = "pending";
+        result.raw.situation = "in_progress";
+        result.note = `smoke ${TRACKING}: still moving on the portal — status=pending`;
+        result.error = null;
       } else {
         result.paymentStatus = "no_action";
         result.raw.situation = "other";
@@ -790,33 +800,43 @@ async function main() {
 
     let captured = await runThroughBoletoAndCapture(entryPath === "path_B_sandwich" ? "08b" : "08a");
 
-    // Empty barcode / already-issued → Path B if we still used Path A
-    if (!captured.linha && !captured.pdfPath && entryPath === "path_A_dollar") {
+    // Empty barcode after Path A: keep the amount. Do not walk back to search
+    // when the portal already refused to issue the boleto — that click timed out
+    // and aborted the rest of the hourly queue.
+    if (!captured.linha && !captured.pdfPath && entryPath === "path_A_dollar" && !captured.portalNotIssued) {
       console.log("Path A pagfacil empty barcode → fallback Path B (sandwich)");
       await shot(page, "08a-empty-barcode.png");
-      // Back to search results
-      await gotoRetry(page, SEARCH_URL);
-      await page.waitForTimeout(1000);
-      const entendi2 = page.getByRole("button", { name: /^Entendi$/i });
-      if (await entendi2.count()) await entendi2.click({ force: true }).catch(() => {});
-      // Re-search
-      const labeled2 = page.getByLabel(/c[oó]digo da encomenda/i);
-      if (await labeled2.count()) await labeled2.fill(TRACKING);
-      else {
-        const boxes2 = page.locator('input[type="text"]:visible');
-        if (await boxes2.count()) await boxes2.first().fill(TRACKING);
+      try {
+        for (const extra of context.pages()) {
+          if (extra !== page) await extra.close().catch(() => {});
+        }
+        await gotoRetry(page, SEARCH_URL);
+        await page.waitForTimeout(1000);
+        const entendi2 = page.getByRole("button", { name: /^Entendi$/i });
+        if (await entendi2.count()) await entendi2.click({ force: true }).catch(() => {});
+        const labeled2 = page.getByLabel(/c[oó]digo da encomenda/i);
+        if (await labeled2.count()) await labeled2.fill(TRACKING);
+        else {
+          const boxes2 = page.locator('input[type="text"]:visible');
+          if (await boxes2.count()) await boxes2.first().fill(TRACKING);
+        }
+        const searchBtn2 = page.locator('input[type="submit"][value*="Pesquisar" i]:visible, button:visible:has-text("Pesquisar")').first();
+        if (await searchBtn2.count()) await searchBtn2.click({ force: true, timeout: 8000 });
+        await page.waitForTimeout(2500);
+        await shot(page, "04b-research-pathB.png");
+        await clickSandwichThenPagar("05c-modal-sandwich-fallback.png");
+        entryPath = "path_B_sandwich_fallback";
+        result.raw.entryPath = entryPath;
+        await waitAguardeGone(page, 30000);
+        await page.waitForTimeout(1000);
+        await shot(page, "05c-efetuar-pagamento.png");
+        captured = await runThroughBoletoAndCapture("08b");
+      } catch (pathBErr) {
+        console.log("Path B fallback skipped:", String(pathBErr?.message || pathBErr).slice(0, 160));
+        if (!result.taxAmount && isNetworkError(pathBErr)) throw pathBErr;
       }
-      const searchBtn2 = page.locator('input[type="submit"][value*="Pesquisar" i]:visible, button:visible:has-text("Pesquisar")').first();
-      if (await searchBtn2.count()) await searchBtn2.click();
-      await page.waitForTimeout(2500);
-      await shot(page, "04b-research-pathB.png");
-      await clickSandwichThenPagar("05c-modal-sandwich-fallback.png");
-      entryPath = "path_B_sandwich_fallback";
-      result.raw.entryPath = entryPath;
-      await waitAguardeGone(page, 30000);
-      await page.waitForTimeout(1000);
-      await shot(page, "05c-efetuar-pagamento.png");
-      captured = await runThroughBoletoAndCapture("08b");
+    } else if (captured.portalNotIssued) {
+      console.log("Path A boleto not issued — keep amount, skip Path B");
     }
 
     result.taxAmount = result.taxAmount || captured.amount;
@@ -831,7 +851,9 @@ async function main() {
     result.raw.urlBoleto = captured.urlBoleto;
     result.raw.entryPath = entryPath;
 
-    result.paymentStatus = result.pdfPath || result.linha ? "boleto_generated" : "awaiting_payment";
+    if (result.pdfPath || result.linha) result.paymentStatus = "boleto_generated";
+    else if (result.taxAmount && (captured.portalNotIssued || captured.paymentStatusHint === "boleto_pending")) result.paymentStatus = "boleto_pending";
+    else result.paymentStatus = "awaiting_payment";
     result.ok = Boolean(result.taxAmount || result.linha);
     result.note = `smoke ${TRACKING}: path=${entryPath} valor=${result.taxAmount || "?"} status=${result.paymentStatus} linha=${result.linha ? "yes" : "no"} pdf=${result.pdfPath ? "yes" : "no"}`;
 
@@ -853,7 +875,32 @@ async function main() {
         const msg = err instanceof Error ? err.message : String(err);
         result.error = msg;
         result.ok = false;
-        if (isTransientError(err)) {
+        if (result.taxAmount) {
+          result.paymentStatus = result.linha || result.pdfPath ? "boleto_generated" : "boleto_pending";
+          result.ok = true;
+          result.error = null;
+          result.note = `smoke ${TRACKING}: kept amount ${result.taxAmount} after ${msg.slice(0, 80)}`;
+          try {
+            const db = await upsertDb(env, result);
+            console.log("DB:", JSON.stringify(db, null, 2));
+            console.log("SMOKE_OK", JSON.stringify({
+              tracking: TRACKING,
+              taxAmount: result.taxAmount,
+              linha: result.linha,
+              pdfPath: result.pdfPath,
+              paymentStatus: result.paymentStatus,
+              orderId: db.order?.id || null,
+              taxId: db.tax?.id || null,
+              boletoId: db.boleto?.id || null,
+            }));
+          } catch (dbErr) {
+            console.error("DB upsert failed:", dbErr instanceof Error ? dbErr.message : dbErr);
+            console.log("SMOKE_RETRY", JSON.stringify({ tracking: TRACKING, error: msg.slice(0, 300) }));
+          }
+          transientStreak = 0;
+          continue;
+        }
+        if (isNetworkError(err)) {
           transientStreak += 1;
           console.log("transient", TRACKING, `${transientStreak}/3`, msg.slice(0, 160));
           if (transientStreak >= 3) {
